@@ -282,7 +282,7 @@ footer a{color:var(--muted)}
         </div>
         <div style="margin-top:11px">
           <label for="sRelay">Relay — your own CORS worker (blank = public relays)</label>
-          <input id="sRelay" placeholder="https://levelwatch.you.workers.dev" spellcheck="false" style="font-size:13px">
+          <input id="sRelay" placeholder="paste your workers.dev address here" spellcheck="false" style="font-size:13px">
         </div>
         <div class="btn-row">
           <button class="btn ghost" id="btnTest">Test feed</button>
@@ -633,33 +633,43 @@ function relays(){
 let relayIdx = 0;
 let lastRelay = '';
 
-function yahooURL(sym, interval, host){
-  // 5 days of history: Bollinger has its 20 candles from the opening bell, and a
-  // market that has not opened yet still shows its previous session.
-  const range = interval==='1m' ? '5d' : interval==='5m' ? '10d' : '1mo';
+// Yahoo rejects some interval/range pairs outright, and which pairs it rejects
+// varies by symbol. Ask for history first, fall back to the single session that
+// always works. Bollinger simply has fewer candles on the fallback.
+function rangesFor(interval){
+  return interval==='1m' ? ['2d','1d'] : interval==='5m' ? ['5d','1d'] : ['1mo','5d','1d'];
+}
+function yahooURL(sym, interval, range, host){
   return 'https://'+(host||'query1')+'.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(sym) +
          '?interval=' + interval + '&range=' + range + '&includePrePost=false';
 }
 
-async function tryRelay(r, sym, interval){
-  const target = yahooURL(sym, interval);
+async function fetchOnce(r, sym, interval, range){
+  const target = yahooURL(sym, interval, range);
   const ctl = new AbortController();
   const to = setTimeout(()=>ctl.abort(), 9000);
   try{
     const res = await fetch(r.build(target), {cache:'no-store', signal:ctl.signal});
-    if(!res.ok) throw new Error('HTTP '+res.status);
-    const txt = await res.text();
-    let j;
-    try{ j = JSON.parse(txt); }
-    catch(e){ throw new Error('not JSON — got "'+txt.slice(0,60).replace(/\s+/g,' ')+'"'); }
-    const out = j && j.chart && j.chart.result && j.chart.result[0];
-    if(!out){
-      const err = j && j.chart && j.chart.error && j.chart.error.description;
-      throw new Error(err || 'no data for that symbol');
-    }
-    if(!out.timestamp || !out.timestamp.length) throw new Error('no candles returned — check the symbol');
+    const txt = await res.text();          // read it either way — errors carry the reason
+    let j=null;
+    try{ j = JSON.parse(txt); }catch(e){}
+    const yerr = j && j.chart && j.chart.error && (j.chart.error.description || j.chart.error.code);
+    if(!res.ok) throw new Error('HTTP '+res.status+(yerr?' — '+yerr:'')+(!j?' — '+txt.slice(0,50).replace(/\s+/g,' '):''));
+    if(!j) throw new Error('not JSON — got "'+txt.slice(0,50).replace(/\s+/g,' ')+'"');
+    const out = j.chart && j.chart.result && j.chart.result[0];
+    if(!out) throw new Error(yerr || 'no data for that symbol');
+    if(!out.timestamp || !out.timestamp.length) throw new Error('no candles at '+interval+'/'+range);
     return parseChart(out);
   } finally { clearTimeout(to); }
+}
+
+async function tryRelay(r, sym, interval){
+  let last=null;
+  for(const range of rangesFor(interval)){
+    try{ return await fetchOnce(r, sym, interval, range); }
+    catch(e){ last=e; if(e.name==='AbortError') throw e; }
+  }
+  throw last || new Error('no usable range');
 }
 
 async function fetchBars(sym, interval){
@@ -807,7 +817,7 @@ function analyse(bars, all){
   const pats=Core.detectPatterns(bars);
   return {
     vwap:vw[vw.length-1], vwapSeries:vw, bb,
-    relVol:Core.relVolume(bars,20), atr:Core.atr(bars,14),
+    relVol:Core.relVolume(bars.length>2?bars.slice(0,-1):bars,20), atr:Core.atr(bars,14),
     pats, bias:Core.patternBias(pats), trend:Core.trendOf(bars), last:bars[bars.length-1]
   };
 }
