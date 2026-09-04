@@ -162,6 +162,18 @@ canvas{width:100%;height:100%;display:block}
 @media(min-width:620px){ .settings{grid-template-columns:repeat(4,1fr)} }
 .toggle{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
 .toggle input{width:auto}
+.setup{display:grid;gap:12px;grid-template-columns:1fr}
+@media(min-width:620px){ .setup{grid-template-columns:1.15fr .85fr} }
+.side{font-size:26px;font-weight:600;letter-spacing:-.02em}
+.side.long{color:var(--up)} .side.short{color:var(--down)} .side.flat{color:var(--muted)}
+.setup p{margin:5px 0 0;font-size:13px;color:var(--muted);line-height:1.5}
+.rsn{display:flex;gap:8px;font-size:12.5px;color:var(--muted);padding:2px 0}
+.rsn i{font-style:normal;width:12px;text-align:center}
+.rsn i.p{color:var(--up)} .rsn i.m{color:var(--down)} .rsn i.z{color:var(--dim)}
+.plan{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:11px}
+.plan .row{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:var(--muted)}
+.plan .row b{font-family:"IBM Plex Mono",monospace;font-weight:500;color:var(--ink)}
+.plan .verdict{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:12.5px}
 .diag{margin-top:9px;font-size:11.5px;line-height:1.7}
 .diag .drow{font-family:"IBM Plex Mono",monospace;white-space:normal;word-break:break-word;color:var(--dim)}
 .diag .drow b{color:var(--ink);font-weight:500;margin-right:5px}
@@ -199,7 +211,7 @@ footer a{color:var(--muted)}
             <select id="fEx">
               <option value=".NS">NSE</option>
               <option value=".BO">BSE</option>
-              <option value="">As typed</option>
+              <option value="">US / as typed</option>
             </select>
           </div>
           <div>
@@ -319,6 +331,19 @@ footer a{color:var(--muted)}
       </div>
 
       <div class="card">
+        <h2>Intraday setup <span id="setupStale" class="mono" style="float:right;font-size:11.5px;color:var(--mark)"></span></h2>
+        <div class="setup">
+          <div>
+            <div id="setupSide" class="side">Stand aside</div>
+            <p id="setupWhy">Waiting for data.</p>
+            <div id="setupReasons" style="margin-top:9px"></div>
+          </div>
+          <div class="plan" id="setupPlan"></div>
+        </div>
+        <p class="hint">A confluence checklist, not a signal. It agrees with itself by construction — VWAP, bands and candles are all functions of the same price series — so treat it as a reason to look, never a reason to click. Most intraday setups lose money after brokerage, STT and slippage.</p>
+      </div>
+
+      <div class="card">
         <h2>Alert log</h2>
         <ul class="log" id="log"><li class="empty">No alerts yet. Levels fire once each, then latch until you re-arm.</li></ul>
       </div>
@@ -326,7 +351,7 @@ footer a{color:var(--muted)}
   </div>
 
   <footer>
-    Data via Yahoo Finance, relayed through a public CORS proxy because this page has no backend — quotes are delayed and can fail; treat the ladder as a watch aid, not an order system. Nothing here is investment advice.
+    Data via Yahoo Finance through a CORS relay, because this page has no backend — quotes are delayed by up to a minute and can fail. The setup panel is a checklist built from indicators, not a recommendation, and nothing here is investment advice. Treat the ladder as a watch aid, not an order system.
     <br>Built by <a href="https://www.linkedin.com/in/pawan-maheshwari-4b9b4715" target="_blank" rel="noopener">Pawan Maheshwari</a> · Planet AI
   </footer>
 </div>
@@ -502,18 +527,69 @@ const Core = (function(){
 
   function inferDirection(ltp,target){ return target>=ltp ? 'up' : 'down'; }
 
-  // NSE/BSE cash session, IST, Mon–Fri
-  function marketState(d){
-    const ist = new Date(d.getTime() + (d.getTimezoneOffset()*60000) + (5.5*3600000));
-    const day = ist.getDay(), mins = ist.getHours()*60 + ist.getMinutes();
-    if(day===0 || day===6) return 'closed';
-    if(mins>=555 && mins<=930) return 'open';       // 09:15–15:30
-    if(mins>=540 && mins<555) return 'pre-open';    // 09:00–09:15
+  function marketOf(sym){ return /\.(NS|BO)$/i.test(sym||'') ? 'IN' : 'US'; }
+
+  function zoneParts(d, tz){
+    const f = new Intl.DateTimeFormat('en-US',{timeZone:tz,hour12:false,weekday:'short',hour:'2-digit',minute:'2-digit'});
+    const p={}; f.formatToParts(d).forEach(x=>{ p[x.type]=x.value; });
+    return {wd:p.weekday, mins:(Number(p.hour)%24)*60 + Number(p.minute)};
+  }
+
+  // Cash session for the instrument's own exchange, DST included.
+  function marketState(d, market){
+    const cfg = market==='US' ? {tz:'America/New_York', open:570, close:960, pre:0}
+                              : {tz:'Asia/Kolkata',    open:555, close:930, pre:540};
+    const z = zoneParts(d, cfg.tz);
+    if(z.wd==='Sat'||z.wd==='Sun') return 'closed';
+    if(z.mins>=cfg.open && z.mins<=cfg.close) return 'open';
+    if(cfg.pre && z.mins>=cfg.pre && z.mins<cfg.open) return 'pre-open';
     return 'closed';
   }
 
+  // Mechanical confluence check. Deliberately hard to satisfy: it returns
+  // "stand aside" unless several independent readings agree.
+  function setupScore(x){
+    const r=[]; let s=0;
+    if(x.vwap){
+      if(x.px>x.vwap){ s++; r.push({t:'Holding above VWAP',w:1}); }
+      else { s--; r.push({t:'Trapped below VWAP',w:-1}); }
+    }
+    if(x.pctB!=null){
+      if(x.pctB>0.8){ s++; r.push({t:'Riding the upper band',w:1}); }
+      else if(x.pctB<0.2){ s--; r.push({t:'Pinned to the lower band',w:-1}); }
+      else r.push({t:'Mid-band — no directional edge',w:0});
+    }
+    if(x.bias==='b'){ s++; r.push({t:'Candles reading bullish',w:1}); }
+    else if(x.bias==='s'){ s--; r.push({t:'Candles reading bearish',w:-1}); }
+    else r.push({t:'No candle formation',w:0});
+    if(x.trend==='up'){ s++; r.push({t:'Short-term trend up',w:1}); }
+    else if(x.trend==='down'){ s--; r.push({t:'Short-term trend down',w:-1}); }
+    else r.push({t:'Trend flat',w:0});
+    if(x.relVol!=null){
+      if(x.relVol>=1.2){ s += Math.sign(s); r.push({t:'Volume confirming ('+round(x.relVol,1)+'x)',w:1}); }
+      else if(x.relVol<0.7){ s -= Math.sign(s); r.push({t:'Thin volume — signals unreliable',w:0}); }
+    }
+    const side = s>=3 ? 'long' : s<=-3 ? 'short' : 'flat';
+    const atr = x.atr||0;
+    let stop=null, target=null, rr=null, risk=null;
+    if(side!=='flat' && atr>0){
+      if(side==='long'){
+        stop = Math.min(x.last.l, x.vwap||x.last.l) - 0.25*atr;
+        target = (x.target && x.target>x.px) ? x.target : x.px + 2*atr;
+      } else {
+        stop = Math.max(x.last.h, x.vwap||x.last.h) + 0.25*atr;
+        target = (x.target && x.target<x.px) ? x.target : x.px - 2*atr;
+      }
+      risk = Math.abs(x.px-stop);
+      rr = risk>0 ? Math.abs(target-x.px)/risk : null;
+    }
+    return {side, score:s, reasons:r, stop, target, rr, risk,
+            viable: side!=='flat' && rr!=null && rr>=1.5};
+  }
+
   return {round,smaSeries,bollingerSeries,bollingerNow,vwapSeries,relVolume,atr,anat,trendOf,
-          detectPatterns,patternBias,newAlertState,evaluateAlerts,inferDirection,marketState};
+          detectPatterns,patternBias,newAlertState,evaluateAlerts,inferDirection,
+          marketState,marketOf,zoneParts,setupScore};
 })();
 // ==== CORE END ====
 
@@ -558,8 +634,11 @@ let relayIdx = 0;
 let lastRelay = '';
 
 function yahooURL(sym, interval, host){
+  // 5 days of history: Bollinger has its 20 candles from the opening bell, and a
+  // market that has not opened yet still shows its previous session.
+  const range = interval==='1m' ? '5d' : interval==='5m' ? '10d' : '1mo';
   return 'https://'+(host||'query1')+'.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(sym) +
-         '?interval=' + interval + '&range=1d&includePrePost=false';
+         '?interval=' + interval + '&range=' + range + '&includePrePost=false';
 }
 
 async function tryRelay(r, sym, interval){
@@ -578,7 +657,7 @@ async function tryRelay(r, sym, interval){
       const err = j && j.chart && j.chart.error && j.chart.error.description;
       throw new Error(err || 'no data for that symbol');
     }
-    if(!out.timestamp || !out.timestamp.length) throw new Error('empty session — market may not have opened yet');
+    if(!out.timestamp || !out.timestamp.length) throw new Error('no candles returned — check the symbol');
     return parseChart(out);
   } finally { clearTimeout(to); }
 }
@@ -625,8 +704,15 @@ function parseChart(res){
     bars.push({ts:t[i]*1000,o,h,l,c,v:(q.volume&&q.volume[i])||0});
   }
   const m = res.meta || {};
+  // The session is every bar sharing the last bar's local calendar date at the
+  // exchange. VWAP, patterns and the ladder use this; Bollinger uses everything.
+  const off = (m.gmtoffset||0)*1000;
+  const dayOf = b => Math.floor((b.ts + off)/86400000);
+  const session = bars.length ? bars.filter(b => dayOf(b)===dayOf(bars[bars.length-1])) : [];
   return {
-    bars,
+    bars: session.length ? session : bars,
+    barsAll: bars,
+    stale: session.length ? false : true,
     quote:{
       ltp: m.regularMarketPrice != null ? m.regularMarketPrice : (bars.length?bars[bars.length-1].c:null),
       prevClose: m.chartPreviousClose != null ? m.chartPreviousClose : m.previousClose,
@@ -663,6 +749,8 @@ function demoBars(sym, interval){
   const closes=d.bars.map(b=>b.c);
   return Promise.resolve({
     bars:d.bars.map(b=>({...b})),
+    barsAll:d.bars.map(b=>({...b})),
+    stale:false,
     quote:{ltp:d.last,prevClose:d.bars[0].o,dayHigh:Math.max(...d.bars.map(b=>b.h)),dayLow:Math.min(...d.bars.map(b=>b.l)),name:sym+' (demo)',ts:Date.now()}
   });
 }
@@ -711,11 +799,11 @@ function push(w,a,snapshot){
 }
 
 /* ---------------- TA snapshot text ---------------- */
-function analyse(bars){
+function analyse(bars, all){
   if(!bars || bars.length<3) return null;
-  const closes=bars.map(b=>b.c);
+  const hist = (all && all.length>=bars.length) ? all : bars;
   const vw=Core.vwapSeries(bars);
-  const bb=Core.bollingerNow(closes,20,2);
+  const bb=Core.bollingerNow(hist.map(b=>b.c),20,2);
   const pats=Core.detectPatterns(bars);
   return {
     vwap:vw[vw.length-1], vwapSeries:vw, bb,
@@ -744,11 +832,11 @@ async function tick(){
   for(const w of S.watches){
     try{
       const d = await fetchBars(w.sym, S.settings.interval);
-      w.bars=d.bars; w.quote=d.quote; anyOk=true;
+      w.bars=d.bars; w.barsAll=d.barsAll||d.bars; w.stale=!!d.stale; w.quote=d.quote; anyOk=true;
       const px=d.quote.ltp;
       if(px==null) continue;
       if(!w.direction) w.direction=Core.inferDirection(px,w.target);
-      const a=analyse(d.bars);
+      const a=analyse(d.bars, w.barsAll);
       const closed = d.bars.length>1 ? d.bars[d.bars.length-2] : null;   // second-last bar is the last *completed* one
       const fired=Core.evaluateAlerts(
         {target:w.target,alert1:w.alert1,breakBuffer:w.buf,minRelVol:w.minVol,direction:w.direction,requireVolume:w.minVol>0},
@@ -774,15 +862,21 @@ function setFeed(ok, err){
 }
 
 /* ---------------- render ---------------- */
+function clockText(mkt){
+  const tz = mkt==='US' ? 'America/New_York' : 'Asia/Kolkata';
+  return new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:tz})+(mkt==='US'?' ET':' IST');
+}
 function fmt(v,d=2){ return v==null||!isFinite(v) ? '—' : Number(v).toLocaleString('en-IN',{minimumFractionDigits:d,maximumFractionDigits:d}); }
 function focused(){ return S.watches.find(w=>w.id===S.focus) || S.watches[0] || null; }
 
 function render(){
   renderChips(); renderHead(); renderLadder(); renderTA(); drawChart();
-  const st=Core.marketState(new Date());
+  const w0=focused();
+  const mkt = Core.marketOf(w0?w0.sym:'.NS');
+  const st=Core.marketState(new Date(), mkt);
   const m=$('pillMarket');
-  m.textContent='market '+st; m.className='pill '+(st==='open'?'ok':st==='pre-open'?'warn':'');
-  $('pillClock').textContent=new Date().toLocaleTimeString('en-IN',{hour12:false,timeZone:'Asia/Kolkata'})+' IST';
+  m.textContent=(mkt==='US'?'US ':'NSE ')+st; m.className='pill '+(st==='open'?'ok':st==='pre-open'?'warn':'');
+  $('pillClock').textContent=clockText(mkt);
 }
 
 function renderChips(){
@@ -855,7 +949,7 @@ function renderLadder(){
 
 function renderTA(){
   const w=focused();
-  const a = w ? analyse(w.bars) : null;
+  const a = w ? analyse(w.bars, w.barsAll) : null;
   if(!a){ return; }
   const px=w.quote?w.quote.ltp:a.last.c;
 
@@ -888,6 +982,47 @@ function renderTA(){
       : 'Price is inside the bands; nothing stretched at this level.';
   }
   $('chartMeta').textContent = w.bars.length + ' × ' + S.settings.interval + (a.atr? ' · ATR '+fmt(a.atr):'');
+  renderSetup(a, w);
+}
+
+function renderSetup(a, w){
+  const px = w && w.quote ? w.quote.ltp : null;
+  $('setupStale').textContent = (w && w.stale) ? 'previous session' : '';
+  if(!a || px==null){ return; }
+  const r = Core.setupScore({
+    px, vwap:a.vwap, pctB:a.bb?a.bb.pctB:null, bias:a.bias, trend:a.trend,
+    relVol:a.relVol, atr:a.atr, last:a.last, target:w.target
+  });
+  const el=$('setupSide');
+  el.textContent = r.side==='long'?'Long bias':r.side==='short'?'Short bias':'Stand aside';
+  el.className='side '+r.side;
+  $('setupWhy').textContent = r.side==='flat'
+    ? 'The readings disagree. Nothing here is worth risking capital on — waiting is a position.'
+    : (r.viable
+        ? 'Four or more readings point the same way and the reward covers the risk.'
+        : 'The readings agree, but the level is too close to pay for the stop. Wait for a better price.');
+  const rs=$('setupReasons'); rs.innerHTML='';
+  r.reasons.forEach(x=>{
+    const d=document.createElement('div'); d.className='rsn';
+    d.innerHTML='<i class="'+(x.w>0?'p':x.w<0?'m':'z')+'">'+(x.w>0?'+':x.w<0?'−':'·')+'</i><span></span>';
+    d.querySelector('span').textContent=x.t; rs.appendChild(d);
+  });
+  const plan=$('setupPlan');
+  if(r.side==='flat' || r.stop==null){
+    plan.innerHTML='<div class="row"><span>Score</span><b>'+r.score+' / 5</b></div>'+
+      '<div class="verdict" style="color:var(--muted)">No trade plan while the score sits under 3.</div>';
+    return;
+  }
+  plan.innerHTML =
+    '<div class="row"><span>Score</span><b>'+(r.score>0?'+':'')+r.score+' / 5</b></div>'+
+    '<div class="row"><span>Reference price</span><b>'+fmt(px)+'</b></div>'+
+    '<div class="row"><span>Invalidation</span><b>'+fmt(r.stop)+'</b></div>'+
+    '<div class="row"><span>Risk per share</span><b>'+fmt(r.risk)+'</b></div>'+
+    '<div class="row"><span>Objective</span><b>'+fmt(r.target)+'</b></div>'+
+    '<div class="row"><span>Reward : risk</span><b>'+(r.rr?fmt(r.rr,2)+' : 1':'—')+'</b></div>'+
+    '<div class="verdict" style="color:'+(r.viable?'var(--up)':'var(--mark)')+'">'+
+      (r.viable ? 'Meets the 1.5:1 floor. Size so the invalidation costs what you can afford to lose.'
+                : 'Below the 1.5:1 floor — the maths does not justify the trade.')+'</div>';
 }
 
 function renderLog(){
@@ -917,8 +1052,10 @@ function drawChart(){
 
   const N=Math.min(w.bars.length, W<520?42:72);
   const bars=w.bars.slice(-N);
-  const closesAll=w.bars.map(b=>b.c);
-  const bbAll=Core.bollingerSeries(closesAll,20,2);
+  const hist=(w.barsAll&&w.barsAll.length>=w.bars.length)?w.barsAll:w.bars;
+  const bbFull=Core.bollingerSeries(hist.map(b=>b.c),20,2);
+  const skip=hist.length-w.bars.length;   // realign history indices onto session bars
+  const bbAll={mid:bbFull.mid.slice(skip),up:bbFull.up.slice(skip),lo:bbFull.lo.slice(skip)};
   const vwAll=Core.vwapSeries(w.bars);
   const off=w.bars.length-N;
   const brk = w.direction==='up' ? w.target*(1+w.buf/100) : w.target*(1-w.buf/100);
@@ -1031,7 +1168,7 @@ function init(){
   $('sSound').checked=S.settings.sound; $('sDemo').checked=S.settings.demo; $('sRelay').value=S.settings.relay||'';
   notifyOK = ('Notification' in window) && Notification.permission==='granted';
   bind(); renderLog(); render();
-  setInterval(()=>{ $('pillClock').textContent=new Date().toLocaleTimeString('en-IN',{hour12:false,timeZone:'Asia/Kolkata'})+' IST'; },1000);
+  setInterval(()=>{ const w0=focused(); $('pillClock').textContent=clockText(Core.marketOf(w0?w0.sym:'.NS')); },1000);
   if(S.watches.length){ start(); tick(); }
 }
 if(typeof document!=='undefined' && document.getElementById('cv')) init();
