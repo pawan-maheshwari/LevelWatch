@@ -174,6 +174,11 @@ canvas{width:100%;height:100%;display:block}
 .plan .row{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:var(--muted)}
 .plan .row b{font-family:"IBM Plex Mono",monospace;font-weight:500;color:var(--ink)}
 .plan .verdict{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:12.5px}
+.sug{display:block;width:100%;text-align:left;background:var(--panel2);border:1px solid var(--line);
+  border-radius:7px;padding:7px 10px;margin:4px 0;font-size:12.5px}
+.sug:hover{border-color:var(--mark)}
+.sug b{font-family:"IBM Plex Mono",monospace;color:var(--mark);margin-right:7px}
+.sug span{color:var(--muted)}
 .diag{margin-top:9px;font-size:11.5px;line-height:1.7}
 .diag .drow{font-family:"IBM Plex Mono",monospace;white-space:normal;word-break:break-word;color:var(--dim)}
 .diag .drow b{color:var(--ink);font-weight:500;margin-right:5px}
@@ -235,6 +240,7 @@ footer a{color:var(--muted)}
           <button class="btn" id="btnWatch">Start watching</button>
           <button class="btn ghost" id="btnArm" style="width:auto;padding:10px 12px" title="Enable sound + notifications">🔔</button>
         </div>
+        <div id="suggest" class="diag"></div>
         <p class="hint" id="hintDir">Alert 2 fires at the look-out price. Alert 3 fires only when a candle <em>closes</em> beyond it with volume — a confirmed break, not a wick.</p>
       </div>
 
@@ -686,6 +692,50 @@ async function fetchBars(sym, interval){
   throw err;
 }
 
+async function relayJSON(url){
+  const list=relays();
+  for(let k=0;k<list.length;k++){
+    const i=(relayIdx+k)%list.length;
+    const ctl=new AbortController(); const to=setTimeout(()=>ctl.abort(),9000);
+    try{
+      const res=await fetch(list[i].build(url),{cache:'no-store',signal:ctl.signal});
+      const txt=await res.text();
+      if(!res.ok) continue;
+      return JSON.parse(txt);
+    }catch(e){}
+    finally{ clearTimeout(to); }
+  }
+  return null;
+}
+
+// Yahoo's own symbol search, so a company name resolves to a tradeable ticker.
+async function suggestSymbols(q){
+  const j = await relayJSON('https://query1.finance.yahoo.com/v1/finance/search?q='+
+            encodeURIComponent(q)+'&quotesCount=6&newsCount=0&listsCount=0');
+  if(!j || !Array.isArray(j.quotes)) return [];
+  return j.quotes
+    .filter(x=>x.symbol && ['EQUITY','INDEX','ETF'].indexOf(x.quoteType)>=0)
+    .slice(0,5)
+    .map(x=>({sym:x.symbol, name:x.shortname||x.longname||'', ex:x.exchDisp||''}));
+}
+
+async function showSuggestions(q){
+  const box=$('suggest'); if(!box) return;
+  box.innerHTML='<div class="drow">Looking up "'+q.replace(/</g,'&lt;')+'" …</div>';
+  const list=await suggestSymbols(q);
+  if(!list.length){ box.innerHTML='<div class="drow">No instrument matches "'+q.replace(/</g,'&lt;')+'". Check the ticker on the exchange website.</div>'; return; }
+  box.innerHTML='<div class="drow" style="margin-bottom:4px">Did you mean:</div>';
+  list.forEach(x=>{
+    const b=document.createElement('button');
+    b.className='sug';
+    b.innerHTML='<b></b><span></span>';
+    b.querySelector('b').textContent=x.sym;
+    b.querySelector('span').textContent=(x.name?x.name:'')+(x.ex?' · '+x.ex:'');
+    b.onclick=()=>{ $('fSym').value=x.sym; $('fEx').value=''; box.innerHTML=''; addWatch(); };
+    box.appendChild(b);
+  });
+}
+
 async function testFeed(){
   const box=$('diag'); const sym=($('fSym').value.trim().toUpperCase()||'CDSL');
   const full = sym.includes('.')||sym.startsWith('^') ? sym : sym+$('fEx').value;
@@ -852,7 +902,9 @@ async function tick(){
         {target:w.target,alert1:w.alert1,breakBuffer:w.buf,minRelVol:w.minVol,direction:w.direction,requireVolume:w.minVol>0},
         w.state, px, closed, {relVol:a?Core.relVolume(d.bars.slice(0,-1),20):null});
       for(const f of fired) push(w,f,snapshotText(a,px));
-    }catch(e){ err=e; }
+    }catch(e){ err=e;
+      if(/no data|404|no candles|not found/i.test(e.message||'')) showSuggestions(w.label);
+    }
     await new Promise(r=>setTimeout(r,250));
   }
   busy=false;
@@ -1142,7 +1194,7 @@ function addWatch(){
   const existing=S.watches.findIndex(x=>x.sym===sym);
   if(existing>=0) S.watches[existing]=w; else S.watches.push(w);
   if(S.watches.length>8) S.watches.shift();
-  S.focus=w.id; save(); render(); start(); tick();
+  S.focus=w.id; $('suggest').innerHTML=''; save(); render(); start(); tick();
 }
 
 function start(){
