@@ -339,6 +339,33 @@ footer a{color:var(--muted)}
       </div>
 
       <div class="card">
+        <h2>Context <span id="ctxWindow" class="mono" style="float:right;font-size:11.5px;color:var(--dim)"></span></h2>
+        <div class="ta">
+          <div class="tacard">
+            <h3>Relative strength</h3>
+            <div id="rsVal" class="big">—</div>
+            <div class="kv"><span>stock today</span><b id="rsStock">—</b></div>
+            <div class="kv"><span>index today</span><b id="rsIndex">—</b></div>
+            <p id="rsNote">Waiting for data.</p>
+          </div>
+          <div class="tacard">
+            <h3>Yesterday</h3>
+            <div id="pdVal" class="big">—</div>
+            <div class="kv"><span>high / low</span><b id="pdHL">—</b></div>
+            <div class="kv"><span>close</span><b id="pdC">—</b></div>
+            <p id="pdNote">Needs a previous session in the history.</p>
+          </div>
+          <div class="tacard">
+            <h3>Volume vs same time</h3>
+            <div id="tvVal" class="big">—</div>
+            <div class="kv"><span>vs trailing 20</span><b id="tvTrail">—</b></div>
+            <div class="kv"><span>baseline days</span><b id="tvDays">—</b></div>
+            <p id="tvNote">Waiting for data.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>Volume profile &amp; phase <span id="phMeta" class="mono" style="float:right;font-size:11.5px;color:var(--dim)"></span></h2>
         <div class="setup">
           <div>
@@ -668,6 +695,85 @@ const Core = (function(){
             confirmedByPOC: ph.abovePOC===null ? null : (long ? ph.abovePOC : !ph.abovePOC)};
   }
 
+
+  // ---- Sessions, prior day, time-of-day volume ---------------------------
+  function groupSessions(bars, off){
+    const out=[]; let cur=null, key=null;
+    for(const b of bars||[]){
+      const k=Math.floor((b.ts + off*1000)/86400000);
+      if(k!==key){ key=k; cur=[]; out.push(cur); }
+      cur.push(b);
+    }
+    return out;
+  }
+
+  function slotOf(ts, off){ return Math.floor((((ts + off*1000)%86400000)+86400000)%86400000/60000); }
+
+  // Intraday volume is U-shaped, so a trailing average flatters midday candles.
+  // Compare each candle against the same clock slot on earlier days instead.
+  function todBaseline(sessions, off){
+    const prior=(sessions||[]).slice(0,-1);
+    const acc={};
+    for(const s of prior) for(const b of s){
+      const k=slotOf(b.ts,off);
+      (acc[k]=acc[k]||[]).push(b.v||0);
+    }
+    const avg={};
+    Object.keys(acc).forEach(k=>{ const a=acc[k]; avg[k]=a.reduce((x,y)=>x+y,0)/a.length; });
+    return {avg, days:prior.length};
+  }
+
+  function relVolAtTime(bar, base, off){
+    if(!bar || !base || !base.days) return null;
+    const k=slotOf(bar.ts,off);
+    let ref=base.avg[k];
+    if(ref==null){
+      const keys=Object.keys(base.avg).map(Number);
+      if(!keys.length) return null;
+      let best=keys[0];
+      for(const kk of keys) if(Math.abs(kk-k)<Math.abs(best-k)) best=kk;
+      ref=base.avg[best];
+    }
+    return ref>0 ? (bar.v||0)/ref : null;
+  }
+
+  function priorSession(sessions){
+    if(!sessions || sessions.length<2) return null;
+    const s=sessions[sessions.length-2];
+    if(!s.length) return null;
+    let hi=-Infinity, lo=Infinity;
+    for(const b of s){ hi=Math.max(hi,b.h); lo=Math.min(lo,b.l); }
+    return {high:hi, low:lo, close:s[s.length-1].c, open:s[0].o, bars:s};
+  }
+
+  // ---- Relative strength against the benchmark ---------------------------
+  // Both measured from their own session open, so it is the stock's move net of
+  // the market's — the part that is actually about this stock.
+  function relativeStrength(stock, index){
+    if(!stock || !stock.length || !index || !index.length) return null;
+    const so=stock[0].o, sl=stock[stock.length-1].c;
+    const io=index[0].o, il=index[index.length-1].c;
+    if(!(so>0) || !(io>0)) return null;
+    const sp=(sl-so)/so*100, ip=(il-io)/io*100;
+    return {stock:sp, index:ip, rs:sp-ip};
+  }
+
+  // Rough session window quality. Midday is thin and produces the most
+  // false balances; the last half hour is unwind, not conviction.
+  function sessionWindow(d, market){
+    const tz = market==='US' ? 'America/New_York' : 'Asia/Kolkata';
+    const z = zoneParts(d, tz);
+    const open = market==='US' ? 570 : 555;
+    const close= market==='US' ? 960 : 930;
+    const m=z.mins;
+    if(m<open || m>close) return {name:'closed', quality:'none'};
+    if(m<open+45) return {name:'opening', quality:'poor'};
+    if(m<open+135) return {name:'morning trend', quality:'good'};
+    if(m<close-120) return {name:'midday lull', quality:'poor'};
+    if(m<close-30) return {name:'afternoon', quality:'good'};
+    return {name:'closing auction run-in', quality:'none'};
+  }
+
   function newAlertState(){ return {a1:false,a2:false,a3:false,rejected:false,lastClosedTs:null}; }
 
   // cfg: {target, alert1, breakBuffer(%), minRelVol, direction:'up'|'down', requireVolume}
@@ -756,7 +862,21 @@ const Core = (function(){
       if(x.relVol>=1.2){ s += Math.sign(s); r.push({t:'Volume confirming ('+round(x.relVol,1)+'x)',w:1}); }
       else if(x.relVol<0.7){ s -= Math.sign(s); r.push({t:'Thin volume — signals unreliable',w:0}); }
     }
-    const side = s>=3 ? 'long' : s<=-3 ? 'short' : 'flat';
+    let checks = 4;   // vwap, bands, candles, trend
+    if(x.rs!=null){
+      checks++;
+      if(x.rs>0.15){ s++; r.push({t:'Outperforming the index (+'+round(x.rs,2)+'%)',w:1}); }
+      else if(x.rs<-0.15){ s--; r.push({t:'Lagging the index ('+round(x.rs,2)+'%)',w:-1}); }
+      else r.push({t:'Moving with the index, not against it',w:0});
+    }
+    if(x.prior){
+      checks++;
+      if(x.px>x.prior.high){ s++; r.push({t:'Above yesterday\u2019s high',w:1}); }
+      else if(x.px<x.prior.low){ s--; r.push({t:'Below yesterday\u2019s low',w:-1}); }
+      else r.push({t:'Inside yesterday\u2019s range',w:0});
+    }
+    const need = Math.max(3, Math.ceil(checks*0.6));
+    const side = s>=need ? 'long' : s<=-need ? 'short' : 'flat';
     const atr = x.atr||0;
     let stop=null, target=null, rr=null, risk=null;
     if(side!=='flat' && atr>0){
@@ -770,14 +890,15 @@ const Core = (function(){
       risk = Math.abs(x.px-stop);
       rr = risk>0 ? Math.abs(target-x.px)/risk : null;
     }
-    return {side, score:s, reasons:r, stop, target, rr, risk,
+    return {side, score:s, checks, need, reasons:r, stop, target, rr, risk,
             viable: side!=='flat' && rr!=null && rr>=1.5};
   }
 
   return {round,smaSeries,bollingerSeries,bollingerNow,vwapSeries,relVolume,atr,anat,trendOf,
           detectPatterns,patternBias,newAlertState,evaluateAlerts,inferDirection,
           marketState,marketOf,zoneParts,setupScore,
-          volumeProfile,findBalance,detectPhase,phasePlan};
+          volumeProfile,findBalance,detectPhase,phasePlan,
+          groupSessions,slotOf,todBaseline,relVolAtTime,priorSession,relativeStrength,sessionWindow};
 })();
 // ==== CORE END ====
 
@@ -954,6 +1075,7 @@ function parseChart(res){
   return {
     bars: session.length ? session : bars,
     barsAll: bars,
+    gmtoffset: m.gmtoffset||0,
     stale: session.length ? false : true,
     quote:{
       ltp: m.regularMarketPrice != null ? m.regularMarketPrice : (bars.length?bars[bars.length-1].c:null),
@@ -992,6 +1114,7 @@ function demoBars(sym, interval){
   return Promise.resolve({
     bars:d.bars.map(b=>({...b})),
     barsAll:d.bars.map(b=>({...b})),
+    gmtoffset:19800,
     stale:false,
     quote:{ltp:d.last,prevClose:d.bars[0].o,dayHigh:Math.max(...d.bars.map(b=>b.h)),dayLow:Math.min(...d.bars.map(b=>b.l)),name:sym+' (demo)',ts:Date.now()}
   });
@@ -1041,7 +1164,7 @@ function push(w,a,snapshot){
 }
 
 /* ---------------- TA snapshot text ---------------- */
-function analyse(bars, all){
+function analyse(bars, all, w){
   if(!bars || bars.length<3) return null;
   const hist = (all && all.length>=bars.length) ? all : bars;
   const vw=Core.vwapSeries(bars);
@@ -1050,7 +1173,8 @@ function analyse(bars, all){
   return {
     vwap:vw[vw.length-1], vwapSeries:vw, bb,
     relVol:Core.relVolume(bars.length>2?bars.slice(0,-1):bars,20), atr:Core.atr(bars,14),
-    pats, bias:Core.patternBias(pats), trend:Core.trendOf(bars), last:bars[bars.length-1]
+    pats, bias:Core.patternBias(pats), trend:Core.trendOf(bars), last:bars[bars.length-1],
+    relVolTod: (w && bars.length>1) ? Core.relVolAtTime(bars[bars.length-2], w.tod, w.off) : null
   };
 }
 function snapshotText(a, px){
@@ -1071,18 +1195,34 @@ async function tick(){
   if(busy || !S.watches.length) return;
   busy=true;
   let anyOk=false, err=null;
+  const benchCache={};
+  async function bench(mkt){
+    const sym = mkt==='US' ? '^GSPC' : '^NSEI';
+    if(sym in benchCache) return benchCache[sym];
+    try{ benchCache[sym]=await fetchBars(sym, S.settings.interval); }
+    catch(e){ benchCache[sym]=null; }
+    return benchCache[sym];
+  }
   for(const w of S.watches){
     try{
       const d = await fetchBars(w.sym, S.settings.interval);
-      w.bars=d.bars; w.barsAll=d.barsAll||d.bars; w.stale=!!d.stale; w.quote=d.quote; anyOk=true;
+      w.bars=d.bars; w.barsAll=d.barsAll||d.bars; w.stale=!!d.stale; w.quote=d.quote;
+      w.off=d.gmtoffset||0; anyOk=true;
+      const sess=Core.groupSessions(w.barsAll, w.off);
+      w.prior=Core.priorSession(sess);
+      w.tod=Core.todBaseline(sess, w.off);
+      const bm=await bench(Core.marketOf(w.sym));
+      w.rs = bm ? Core.relativeStrength(w.bars, bm.bars) : null;
       const px=d.quote.ltp;
       if(px==null) continue;
       if(!w.direction) w.direction=Core.inferDirection(px,w.target);
-      const a=analyse(d.bars, w.barsAll);
+      const a=analyse(d.bars, w.barsAll, w);
       const closed = d.bars.length>1 ? d.bars[d.bars.length-2] : null;   // second-last bar is the last *completed* one
       const fired=Core.evaluateAlerts(
         {target:w.target,alert1:w.alert1,breakBuffer:w.buf,minRelVol:w.minVol,direction:w.direction,requireVolume:w.minVol>0},
-        w.state, px, closed, {relVol:a?Core.relVolume(d.bars.slice(0,-1),20):null});
+        w.state, px, closed,
+        {relVol: (closed && Core.relVolAtTime(closed, w.tod, w.off)) ??
+                 (a?Core.relVolume(d.bars.slice(0,-1),20):null)});
       for(const f of fired) push(w,f,snapshotText(a,px));
     }catch(e){ err=e;
       if(/no data|404|no candles|not found/i.test(e.message||'')) showSuggestions(w.label);
@@ -1193,7 +1333,7 @@ function renderLadder(){
 
 function renderTA(){
   const w=focused();
-  const a = w ? analyse(w.bars, w.barsAll) : null;
+  const a = w ? analyse(w.bars, w.barsAll, w) : null;
   if(!a){ return; }
   const px=w.quote?w.quote.ltp:a.last.c;
 
@@ -1227,6 +1367,7 @@ function renderTA(){
   }
   $('chartMeta').textContent = w.bars.length + ' × ' + S.settings.interval + (a.atr? ' · ATR '+fmt(a.atr):'');
   renderSetup(a, w);
+  renderContext(a, w);
   renderPhase(a, w);
 }
 
@@ -1236,7 +1377,9 @@ function renderSetup(a, w){
   if(!a || px==null){ return; }
   const r = Core.setupScore({
     px, vwap:a.vwap, pctB:a.bb?a.bb.pctB:null, bias:a.bias, trend:a.trend,
-    relVol:a.relVol, atr:a.atr, last:a.last, target:w.target
+    relVol: a.relVolTod!=null ? a.relVolTod : a.relVol,
+    atr:a.atr, last:a.last, target:w.target,
+    rs: w.rs ? w.rs.rs : null, prior: w.prior
   });
   const el=$('setupSide');
   el.textContent = r.side==='long'?'Long bias':r.side==='short'?'Short bias':'Stand aside';
@@ -1254,12 +1397,12 @@ function renderSetup(a, w){
   });
   const plan=$('setupPlan');
   if(r.side==='flat' || r.stop==null){
-    plan.innerHTML='<div class="row"><span>Score</span><b>'+r.score+' / 5</b></div>'+
+    plan.innerHTML='<div class="row"><span>Score</span><b>'+r.score+' (needs '+r.need+' of '+r.checks+')</b></div>'+
       '<div class="verdict" style="color:var(--muted)">No trade plan while the score sits under 3.</div>';
     return;
   }
   plan.innerHTML =
-    '<div class="row"><span>Score</span><b>'+(r.score>0?'+':'')+r.score+' / 5</b></div>'+
+    '<div class="row"><span>Score</span><b>'+(r.score>0?'+':'')+r.score+' (needs '+r.need+' of '+r.checks+')</b></div>'+
     '<div class="row"><span>Reference price</span><b>'+fmt(px)+'</b></div>'+
     '<div class="row"><span>Invalidation</span><b>'+fmt(r.stop)+'</b></div>'+
     '<div class="row"><span>Risk per share</span><b>'+fmt(r.risk)+'</b></div>'+
@@ -1268,6 +1411,55 @@ function renderSetup(a, w){
     '<div class="verdict" style="color:'+(r.viable?'var(--up)':'var(--mark)')+'">'+
       (r.viable ? 'Meets the 1.5:1 floor. Size so the invalidation costs what you can afford to lose.'
                 : 'Below the 1.5:1 floor — the maths does not justify the trade.')+'</div>';
+}
+
+function renderContext(a, w){
+  const mkt=Core.marketOf(w.sym);
+  const win=Core.sessionWindow(new Date(), mkt);
+  const cw=$('ctxWindow');
+  cw.textContent = win.name + (win.quality==='good'?' · favourable':win.quality==='poor'?' · thin':'');
+  cw.style.color = win.quality==='good' ? 'var(--up)' : win.quality==='poor' ? 'var(--mark)' : 'var(--dim)';
+
+  const px = w.quote ? w.quote.ltp : a.last.c;
+  const bmName = mkt==='US' ? 'S&P 500' : 'Nifty 50';
+
+  if(w.rs){
+    const v=$('rsVal');
+    v.textContent=(w.rs.rs>=0?'+':'')+fmt(w.rs.rs,2)+'%';
+    v.className='big '+(w.rs.rs>=0?'up':'down');
+    $('rsStock').textContent=(w.rs.stock>=0?'+':'')+fmt(w.rs.stock,2)+'%';
+    $('rsIndex').textContent=(w.rs.index>=0?'+':'')+fmt(w.rs.index,2)+'%';
+    $('rsNote').textContent = Math.abs(w.rs.rs)<0.15
+      ? 'Moving with '+bmName+'. Any move here is the market, not this stock — the weakest context for a single-name trade.'
+      : w.rs.rs>0 ? 'Outperforming '+bmName+' today. Something specific is bidding this name.'
+                  : 'Underperforming '+bmName+'. Rallies in a laggard tend to fail first.';
+  }
+
+  if(w.prior){
+    const p=w.prior, v=$('pdVal');
+    const loc = px>p.high ? 'Above range' : px<p.low ? 'Below range' : 'Inside range';
+    v.textContent=loc; v.className='big '+(px>p.high?'up':px<p.low?'down':'flat');
+    $('pdHL').textContent=fmt(p.high)+' / '+fmt(p.low);
+    $('pdC').textContent=fmt(p.close);
+    $('pdNote').textContent = px>p.high ? 'Trading above yesterday\u2019s high — yesterday\u2019s sellers are underwater and that level becomes support.'
+      : px<p.low ? 'Below yesterday\u2019s low — yesterday\u2019s buyers are trapped and will sell into strength.'
+      : 'Still inside yesterday\u2019s range. Both sides are roughly even; expect the range edges to matter more than anything intraday.';
+  }
+
+  const tv=$('tvVal');
+  if(a.relVolTod!=null){
+    tv.textContent=fmt(a.relVolTod,2)+'x';
+    tv.className='big '+(a.relVolTod>=1.2?'up':a.relVolTod<0.7?'down':'flat');
+    $('tvNote').textContent = a.relVolTod>=1.5 ? 'Heavy for this time of day. Moves made on this volume tend to hold.'
+      : a.relVolTod<0.7 ? 'Light for this time of day. Breaks on volume this thin usually get given back.'
+      : 'Normal participation for this point in the session.';
+  }
+  $('tvTrail').textContent = a.relVol!=null ? fmt(a.relVol,2)+'x' : '—';
+  $('tvDays').textContent = (w.tod && w.tod.days) ? w.tod.days : '0';
+  if(!w.tod || !w.tod.days){
+    tv.textContent='—';
+    $('tvNote').textContent='No earlier sessions in the history yet, so there is nothing to compare this candle against.';
+  }
 }
 
 function renderPhase(a, w){
@@ -1283,7 +1475,9 @@ function renderPhase(a, w){
   const el=$('phName');
   el.textContent = NAME[ph.phase] + (ph.side ? ' · ' + (ph.side==='long'?'long side':'short side') : '');
   el.className = 'side ' + (ph.phase==='reclaim' ? (ph.side==='long'?'long':'short') : TONE[ph.phase]||'flat');
-  $('phNote').textContent = ph.note;
+  const win=Core.sessionWindow(new Date(), Core.marketOf(w.sym));
+  $('phNote').textContent = ph.note + (ph.phase==='reclaim' && win.quality!=='good'
+    ? '  Note: ' + win.name + ' — the least reliable part of the session for this model.' : '');
 
   $('phPoc').textContent = prof ? fmt(prof.poc) : '—';
   $('phVa').textContent  = prof ? fmt(prof.val)+' – '+fmt(prof.vah) : '—';
@@ -1355,6 +1549,7 @@ function drawChart(){
     if(u!=null){ hi=Math.max(hi,u); lo=Math.min(lo,d); } });
   [w.target,w.alert1,brk].forEach(v=>{ if(v){ hi=Math.max(hi,v); lo=Math.min(lo,v); } });
   if(w._prof){ hi=Math.max(hi,w._prof.vah); lo=Math.min(lo,w._prof.val); }
+  if(w.prior){ hi=Math.max(hi,w.prior.close); lo=Math.min(lo,w.prior.close); }
   const pad=(hi-lo)*0.06||1; lo-=pad; hi+=pad;
   const X=i=>(i+0.5)*((W-PADR)/N);
   const Y=v=>PADT+(hi-v)/(hi-lo)*(H-PADT-PADB);
@@ -1435,6 +1630,17 @@ function drawChart(){
         g.closePath(); g.fill();
       }
     }
+  }
+
+  // yesterday's high, low and close
+  if(w.prior){
+    g.save(); g.setLineDash([6,4]); g.lineWidth=1; g.strokeStyle='rgba(141,154,180,.5)';
+    [['PDH',w.prior.high],['PDL',w.prior.low],['PDC',w.prior.close]].forEach(([lab,v])=>{
+      if(v==null||!isFinite(v)||v>hi||v<lo) return;
+      g.beginPath(); g.moveTo(0,Y(v)); g.lineTo(W-PADR,Y(v)); g.stroke();
+      g.fillStyle='#8D9AB4'; g.textAlign='left'; g.fillText(lab, 4, Y(v)-6);
+    });
+    g.restore();
   }
 
   // candles
