@@ -307,6 +307,8 @@ footer a{color:var(--muted)}
           <span><i style="background:var(--mark)"></i>your levels</span>
           <span><i style="background:#7CB8FF"></i>VWAP</span>
           <span><i style="background:#5A6B8C"></i>Bollinger 20,2</span>
+          <span><i style="background:rgba(242,169,59,.7)"></i>POC</span>
+          <span><i style="background:rgba(124,184,255,.4)"></i>value area</span>
         </div>
       </div>
 
@@ -334,6 +336,22 @@ footer a{color:var(--muted)}
             <p id="bbNote">Waiting for data.</p>
           </div>
         </div>
+      </div>
+
+      <div class="card">
+        <h2>Volume profile &amp; phase <span id="phMeta" class="mono" style="float:right;font-size:11.5px;color:var(--dim)"></span></h2>
+        <div class="setup">
+          <div>
+            <div id="phName" class="side">—</div>
+            <p id="phNote">Waiting for data.</p>
+            <div class="kv" style="margin-top:10px"><span>POC</span><b id="phPoc">—</b></div>
+            <div class="kv"><span>Value area (70%)</span><b id="phVa">—</b></div>
+            <div class="kv"><span>Balance range</span><b id="phRange">—</b></div>
+            <div class="kv"><span>Sweep</span><b id="phSweep">—</b></div>
+          </div>
+          <div class="plan" id="phPlan"></div>
+        </div>
+        <p class="hint">Volume profile is approximated from candle volume spread across each candle's range — a true profile needs tick data, so POC and value area are close but not exact.</p>
       </div>
 
       <div class="card">
@@ -487,6 +505,169 @@ const Core = (function(){
     if(b>s) return 'b'; if(s>b) return 's'; return 'n';
   }
 
+
+  // ---- Volume profile ----------------------------------------------------
+  // Candle volume spread across the bins its range covers. A true profile needs
+  // tick data; this is the standard approximation from OHLCV bars.
+  function volumeProfile(bars, nBins){
+    nBins = nBins || 36;
+    if(!bars || bars.length<3) return null;
+    let lo=Infinity, hi=-Infinity, total=0;
+    for(const b of bars){ lo=Math.min(lo,b.l); hi=Math.max(hi,b.h); total+=b.v||0; }
+    if(!(hi>lo)) return null;
+    const step=(hi-lo)/nBins;
+    const bins=[];
+    for(let i=0;i<nBins;i++) bins.push({lo:lo+i*step, hi:lo+(i+1)*step, mid:lo+(i+0.5)*step, v:0});
+    for(const b of bars){
+      const v=b.v||0; if(!v) continue;
+      const span=b.h-b.l;
+      if(span<=0){
+        const i=Math.min(nBins-1, Math.max(0, Math.floor((b.c-lo)/step)));
+        bins[i].v+=v; continue;
+      }
+      const first=Math.max(0, Math.floor((b.l-lo)/step));
+      const last =Math.min(nBins-1, Math.floor((b.h-lo)/step));
+      for(let i=first;i<=last;i++){
+        const ov=Math.min(b.h,bins[i].hi)-Math.max(b.l,bins[i].lo);
+        if(ov>0) bins[i].v += v*(ov/span);
+      }
+    }
+    let pocIdx=0; for(let i=1;i<nBins;i++) if(bins[i].v>bins[pocIdx].v) pocIdx=i;
+    // Value area: grow outward from the POC, always taking the heavier neighbour.
+    const sum=bins.reduce((a,b)=>a+b.v,0);
+    let acc=bins[pocIdx].v, l=pocIdx, h=pocIdx;
+    while(acc < sum*0.7 && (l>0 || h<nBins-1)){
+      const up = h<nBins-1 ? bins[h+1].v : -1;
+      const dn = l>0 ? bins[l-1].v : -1;
+      if(up>=dn){ h++; acc+=bins[h].v; } else { l--; acc+=bins[l].v; }
+    }
+    return {bins, poc:bins[pocIdx].mid, pocIdx, val:bins[l].lo, vah:bins[h].hi,
+            valIdx:l, vahIdx:h, total:sum, maxBin:bins[pocIdx].v, lo, hi};
+  }
+
+  // ---- Balance (consolidation) -------------------------------------------
+  // The longest recent stretch whose whole range fits inside k x ATR.
+  // Both edges must be tested more than once. Without this a single spike
+  // widens the window enough to qualify, and the balance swallows its own sweep.
+  function edgesHeld(bars, start, end, hi, lo, frac){
+    const band=(hi-lo)*(frac||0.12);
+    let top=0, bot=0;
+    for(let i=start;i<=end;i++){
+      if(bars[i].h >= hi-band) top++;
+      if(bars[i].l <= lo+band) bot++;
+    }
+    return top>=2 && bot>=2;
+  }
+
+  function findBalance(bars, atrVal, opts){
+    const o = Object.assign({k:2.2, minLen:8, maxLen:40, endWithin:30}, opts||{});
+    if(!bars || !atrVal || bars.length<o.minLen) return null;
+    let best=null;
+    const firstEnd = Math.max(o.minLen-1, bars.length-1-o.endWithin);
+    for(let end=bars.length-1; end>=firstEnd; end--){
+      let hi=-Infinity, lo=Infinity;
+      for(let i=end; i>=0 && end-i<o.maxLen; i--){
+        hi=Math.max(hi,bars[i].h); lo=Math.min(lo,bars[i].l);
+        if(hi-lo > o.k*atrVal) break;
+        const len=end-i+1;
+        if(len>=o.minLen && edgesHeld(bars,i,end,hi,lo) &&
+           (!best || len>best.len || (len===best.len && end>best.end)))
+          best={start:i, end, hi, lo, len, height:hi-lo};
+      }
+    }
+    return best;
+  }
+
+  // ---- Accumulation / Manipulation / Distribution -------------------------
+  // balance -> sweep of one side -> reclaim back inside -> expansion the other way.
+  function detectPhase(bars, atrVal, profile, opts){
+    const o = Object.assign({tol:0.1, k:2.2, minLen:8}, opts||{});
+    const bal = findBalance(bars, atrVal, {k:o.k, minLen:o.minLen});
+    if(!bal) return {phase:'none', side:null, balance:null,
+                     note:'No balanced range yet — price is trending or too volatile to define one.'};
+    const tol = o.tol*atrVal;
+    const post = bars.slice(bal.end+1);
+    const out = {phase:'balance', side:null, balance:bal, sweep:null, reclaimed:false,
+                 poc: profile?profile.poc:null, note:''};
+
+    if(!post.length){
+      out.note='Price is balancing. POC is where the volume settled — wait for one side to be swept.';
+      return out;
+    }
+
+    let sweep=null;
+    for(let i=0;i<post.length;i++){
+      const b=post[i];
+      if(!sweep && b.l < bal.lo - tol) sweep={dir:'low', idx:i, extreme:b.l, bar:b};
+      else if(!sweep && b.h > bal.hi + tol) sweep={dir:'high', idx:i, extreme:b.h, bar:b};
+      else if(sweep){
+        if(sweep.dir==='low') sweep.extreme=Math.min(sweep.extreme,b.l);
+        else sweep.extreme=Math.max(sweep.extreme,b.h);
+      }
+    }
+
+    if(!sweep){
+      const last=post[post.length-1];
+      if(last.c>bal.hi){ out.phase='expansion'; out.side='long';
+        out.note='Broke out of the range without sweeping the other side first — a continuation break, not the manipulation model.'; return out; }
+      if(last.c<bal.lo){ out.phase='expansion'; out.side='short';
+        out.note='Broke down without a sweep first — continuation, not the manipulation model.'; return out; }
+      out.note='Still inside the range. Nothing to do until a side gets taken out.';
+      return out;
+    }
+
+    out.sweep=sweep;
+    const after = post.slice(sweep.idx);
+    const bullish = sweep.dir==='low';
+    const reclaimed = after.some(b => bullish ? b.c > bal.lo : b.c < bal.hi);
+    out.reclaimed = reclaimed;
+    const last = bars[bars.length-1];
+    out.lastClose = last.c;
+
+    if(!reclaimed){
+      const beyond = bullish ? (bal.lo - last.c) : (last.c - bal.hi);
+      if(beyond > 0.5*atrVal){
+        out.phase='expansion'; out.side = bullish ? 'short' : 'long';
+        out.note = 'Price closed decisively outside the range and has not come back — read this as a continuation break, not the manipulation model. No entry here.';
+        return out;
+      }
+      out.phase='sweep'; out.side=null;
+      out.note = bullish
+        ? 'The low was taken out and price has not closed back inside. Either a genuine breakdown or a sweep still in progress — no edge until it reclaims.'
+        : 'The high was taken out with no close back inside. Genuine breakout or an unfinished sweep — wait.';
+      return out;
+    }
+
+    // Reclaimed. Has it already expanded through the far side?
+    if(bullish && last.c > bal.hi){ out.phase='distribution'; out.side='long';
+      out.note='Swept the low, reclaimed, and has now expanded above the range. The move is underway — chasing here means buying the distribution.'; return out; }
+    if(!bullish && last.c < bal.lo){ out.phase='distribution'; out.side='short';
+      out.note='Swept the high, reclaimed, and broken below the range. Expansion in progress.'; return out; }
+
+    out.phase='reclaim'; out.side = bullish?'long':'short';
+    out.abovePOC = profile ? (last.c > profile.poc) : null;
+    out.note = bullish
+      ? 'Sell-side liquidity was taken below the range and price closed back inside. This is the entry window in this model.'
+      : 'Buy-side liquidity was taken above the range and price closed back inside. This is the entry window in this model.';
+    return out;
+  }
+
+  // Plan for a reclaim: stop past the sweep, first objective the far side of the
+  // range, second the measured move.
+  function phasePlan(ph, px, atrVal){
+    if(!ph || ph.phase!=='reclaim' || !ph.balance) return null;
+    const b=ph.balance, long=ph.side==='long';
+    const stop = long ? ph.sweep.extreme - 0.15*atrVal : ph.sweep.extreme + 0.15*atrVal;
+    const t1 = long ? b.hi : b.lo;
+    const t2 = long ? b.hi + b.height : b.lo - b.height;
+    const risk = Math.abs(px-stop);
+    return {stop, t1, t2, risk,
+            rr1: risk>0 ? Math.abs(t1-px)/risk : null,
+            rr2: risk>0 ? Math.abs(t2-px)/risk : null,
+            viable: risk>0 && Math.abs(t1-px)/risk >= 1.0,
+            confirmedByPOC: ph.abovePOC===null ? null : (long ? ph.abovePOC : !ph.abovePOC)};
+  }
+
   function newAlertState(){ return {a1:false,a2:false,a3:false,rejected:false,lastClosedTs:null}; }
 
   // cfg: {target, alert1, breakBuffer(%), minRelVol, direction:'up'|'down', requireVolume}
@@ -595,7 +776,8 @@ const Core = (function(){
 
   return {round,smaSeries,bollingerSeries,bollingerNow,vwapSeries,relVolume,atr,anat,trendOf,
           detectPatterns,patternBias,newAlertState,evaluateAlerts,inferDirection,
-          marketState,marketOf,zoneParts,setupScore};
+          marketState,marketOf,zoneParts,setupScore,
+          volumeProfile,findBalance,detectPhase,phasePlan};
 })();
 // ==== CORE END ====
 
@@ -1045,6 +1227,7 @@ function renderTA(){
   }
   $('chartMeta').textContent = w.bars.length + ' × ' + S.settings.interval + (a.atr? ' · ATR '+fmt(a.atr):'');
   renderSetup(a, w);
+  renderPhase(a, w);
 }
 
 function renderSetup(a, w){
@@ -1087,6 +1270,49 @@ function renderSetup(a, w){
                 : 'Below the 1.5:1 floor — the maths does not justify the trade.')+'</div>';
 }
 
+function renderPhase(a, w){
+  if(!a || !w || !w.bars || w.bars.length<10) return;
+  const px = w.quote ? w.quote.ltp : a.last.c;
+  const prof = Core.volumeProfile(w.bars, 36);
+  const ph = Core.detectPhase(w.bars, a.atr, prof);
+  w._prof = prof; w._phase = ph;
+
+  const NAME = {none:'No range', balance:'Consolidation', sweep:'Manipulation',
+                reclaim:'Reclaim — entry window', distribution:'Distribution', expansion:'Expansion'};
+  const TONE = {reclaim:'long', distribution:'short', sweep:'flat', balance:'flat', expansion:'flat', none:'flat'};
+  const el=$('phName');
+  el.textContent = NAME[ph.phase] + (ph.side ? ' · ' + (ph.side==='long'?'long side':'short side') : '');
+  el.className = 'side ' + (ph.phase==='reclaim' ? (ph.side==='long'?'long':'short') : TONE[ph.phase]||'flat');
+  $('phNote').textContent = ph.note;
+
+  $('phPoc').textContent = prof ? fmt(prof.poc) : '—';
+  $('phVa').textContent  = prof ? fmt(prof.val)+' – '+fmt(prof.vah) : '—';
+  $('phRange').textContent = ph.balance ? fmt(ph.balance.lo)+' – '+fmt(ph.balance.hi)+'  ('+ph.balance.len+' bars)' : 'none';
+  $('phSweep').textContent = ph.sweep ? (ph.sweep.dir==='low'?'low taken at ':'high taken at ')+fmt(ph.sweep.extreme) : '—';
+  $('phMeta').textContent = prof ? 'POC '+fmt(prof.poc) : '';
+
+  const plan=$('phPlan');
+  const p = Core.phasePlan(ph, px, a.atr);
+  if(!p){
+    plan.innerHTML = '<div class="verdict" style="color:var(--muted);border:0;padding:0;margin:0">'+
+      (ph.phase==='reclaim' ? 'No plan — missing data.' :
+       ph.phase==='sweep' ? 'No plan while the sweep is unresolved. The reclaim is the trigger.' :
+       'No plan outside the reclaim window.')+'</div>';
+    return;
+  }
+  plan.innerHTML =
+    '<div class="row"><span>Reference price</span><b>'+fmt(px)+'</b></div>'+
+    '<div class="row"><span>Invalidation</span><b>'+fmt(p.stop)+'</b></div>'+
+    '<div class="row"><span>Risk per share</span><b>'+fmt(p.risk)+'</b></div>'+
+    '<div class="row"><span>Objective 1 (range)</span><b>'+fmt(p.t1)+'  '+(p.rr1?fmt(p.rr1,2)+':1':'')+'</b></div>'+
+    '<div class="row"><span>Objective 2 (measured)</span><b>'+fmt(p.t2)+'  '+(p.rr2?fmt(p.rr2,2)+':1':'')+'</b></div>'+
+    '<div class="verdict" style="color:'+(p.confirmedByPOC?'var(--up)':'var(--mark)')+'">'+
+      (p.confirmedByPOC===null ? 'No profile available to cross-check.'
+       : p.confirmedByPOC ? 'Price has reclaimed the correct side of the POC — the stronger version of this setup.'
+       : 'Price has not reclaimed its side of the POC yet. The weaker version — sweeps that fail to clear the POC often just sweep again.')+
+    '</div>';
+}
+
 function renderLog(){
   const ul=$('log'); ul.innerHTML='';
   if(!S.log.length){ ul.innerHTML='<li class="empty">No alerts yet. Levels fire once each, then latch until you re-arm.</li>'; return; }
@@ -1122,12 +1348,13 @@ function drawChart(){
   const off=w.bars.length-N;
   const brk = w.direction==='up' ? w.target*(1+w.buf/100) : w.target*(1-w.buf/100);
 
-  const PADR=52, PADT=8, PADB=16;
+  const PADR=52, PADT=8, PADB=16, PROFW=Math.min(90, (W-PADR)*0.22);
   let lo=Infinity, hi=-Infinity;
   bars.forEach((b,i)=>{ lo=Math.min(lo,b.l); hi=Math.max(hi,b.h);
     const u=bbAll.up[off+i], d=bbAll.lo[off+i];
     if(u!=null){ hi=Math.max(hi,u); lo=Math.min(lo,d); } });
   [w.target,w.alert1,brk].forEach(v=>{ if(v){ hi=Math.max(hi,v); lo=Math.min(lo,v); } });
+  if(w._prof){ hi=Math.max(hi,w._prof.vah); lo=Math.min(lo,w._prof.val); }
   const pad=(hi-lo)*0.06||1; lo-=pad; hi+=pad;
   const X=i=>(i+0.5)*((W-PADR)/N);
   const Y=v=>PADT+(hi-v)/(hi-lo)*(H-PADT-PADB);
@@ -1155,6 +1382,61 @@ function drawChart(){
   g.beginPath(); g.strokeStyle='#7CB8FF'; g.lineWidth=1.4;
   for(let i=0;i<N;i++){ const v=vwAll[off+i]; if(i===0) g.moveTo(X(i),Y(v)); else g.lineTo(X(i),Y(v)); }
   g.stroke();
+  // volume profile histogram, anchored to the right edge
+  const prof=w._prof, ph=w._phase;
+  if(prof && prof.maxBin>0){
+    const x0=W-PADR;
+    prof.bins.forEach((bn,i)=>{
+      const y1=Y(bn.hi), y2=Y(bn.lo), hgt=Math.max(1, y2-y1-0.5);
+      const wdt=(bn.v/prof.maxBin)*PROFW;
+      const inVA = i>=prof.valIdx && i<=prof.vahIdx;
+      g.fillStyle = i===prof.pocIdx ? 'rgba(242,169,59,.55)' : inVA ? 'rgba(124,184,255,.26)' : 'rgba(141,154,180,.16)';
+      g.fillRect(x0-wdt, y1, wdt, hgt);
+    });
+    // value area edges + POC across the panel
+    g.save(); g.setLineDash([2,4]); g.strokeStyle='rgba(124,184,255,.35)'; g.lineWidth=1;
+    [prof.vah, prof.val].forEach(v=>{ g.beginPath(); g.moveTo(0,Y(v)); g.lineTo(W-PADR,Y(v)); g.stroke(); });
+    g.restore();
+    g.save(); g.strokeStyle='rgba(242,169,59,.7)'; g.lineWidth=1.4;
+    g.beginPath(); g.moveTo(0,Y(prof.poc)); g.lineTo(W-PADR,Y(prof.poc)); g.stroke(); g.restore();
+    g.fillStyle='#F2A93B'; g.textAlign='left'; g.fillText('POC', 4, Y(prof.poc)-6);
+  }
+
+  // the balance box, and the reward / risk zones once a reclaim is live
+  if(ph && ph.balance){
+    const b=ph.balance;
+    const bx1=X(Math.max(0, b.start-off)), bx2=X(Math.min(N-1, b.end-off));
+    if(b.end-off >= 0){
+      g.save();
+      g.fillStyle='rgba(141,154,180,.10)'; g.strokeStyle='rgba(141,154,180,.4)'; g.lineWidth=1;
+      g.fillRect(bx1, Y(b.hi), Math.max(4,bx2-bx1), Y(b.lo)-Y(b.hi));
+      g.strokeRect(bx1, Y(b.hi), Math.max(4,bx2-bx1), Y(b.lo)-Y(b.hi));
+      g.restore();
+    }
+    if(ph.phase==='reclaim'){
+      const px=(w.quote&&w.quote.ltp)||bars[bars.length-1].c;
+      const pl=Core.phasePlan(ph, px, Core.atr(w.bars,14));
+      if(pl){
+        const zx=X(N-1)-6, zw=(W-PADR)-zx-2;
+        g.fillStyle='rgba(47,217,138,.14)';
+        g.fillRect(zx, Y(Math.max(px,pl.t2)), zw, Math.abs(Y(pl.t2)-Y(px)));
+        g.fillStyle='rgba(255,95,109,.16)';
+        g.fillRect(zx, Y(Math.max(px,pl.stop)), zw, Math.abs(Y(pl.stop)-Y(px)));
+      }
+    }
+    if(ph.sweep){
+      const si=(b.end+1+ph.sweep.idx)-off;
+      if(si>=0 && si<N){
+        const sy=Y(ph.sweep.extreme), sx=X(si);
+        g.fillStyle=ph.sweep.dir==='low'?'#2FD98A':'#FF5F6D';
+        g.beginPath();
+        if(ph.sweep.dir==='low'){ g.moveTo(sx,sy+9); g.lineTo(sx-4,sy+16); g.lineTo(sx+4,sy+16); }
+        else { g.moveTo(sx,sy-9); g.lineTo(sx-4,sy-16); g.lineTo(sx+4,sy-16); }
+        g.closePath(); g.fill();
+      }
+    }
+  }
+
   // candles
   bars.forEach((b,i)=>{
     const up=b.c>=b.o, x=X(i);
